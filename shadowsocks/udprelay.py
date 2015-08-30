@@ -80,9 +80,12 @@ def client_key(source_addr, server_af):
     return '%s:%s:%d' % (source_addr[0], source_addr[1], server_af)
 
 
+# relay server is either local or remote
 class UDPRelay(object):
     def __init__(self, config, dns_resolver, is_local, stat_callback=None):
         self._config = config
+
+        # analyse config
         if is_local:
             self._listen_addr = config['local_address']
             self._listen_port = config['local_port']
@@ -111,6 +114,9 @@ class UDPRelay(object):
         else:
             self._forbidden_iplist = None
 
+        # init self._server_socket, namely the relay server socket
+        # the server is either local or remote, due to self._listen_addr
+        # then bind the socket to _listen_port
         addrs = socket.getaddrinfo(self._listen_addr, self._listen_port, 0,
                                    socket.SOCK_DGRAM, socket.SOL_UDP)
         if len(addrs) == 0:
@@ -123,6 +129,7 @@ class UDPRelay(object):
         self._server_socket = server_socket
         self._stat_callback = stat_callback
 
+    # get addr of remote server from config
     def _get_a_server(self):
         server = self._config['server']
         server_port = self._config['server_port']
@@ -142,36 +149,72 @@ class UDPRelay(object):
             # just an address
             pass
 
+    # 7.  Procedure for UDP-based clients
+    # Each UDP datagram carries a UDP request header with it
+    # header means all before DATA
+    # +----+------+------+----------+----------+----------+
+    # |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+    # +----+------+------+----------+----------+----------+
+    # | 2  |  1   |  1   | Variable |    2     | Variable |
+    # +----+------+------+----------+----------+----------+
+    #
+    # When a UDP relay server receives a reply datagram from a remote host, it
+    # MUST encapsulate that datagram using the above UDP request header,
+    # and any authentication-method-dependent encapsulation.
+
+    # for a server to relay udp request
     def _handle_server(self):
         server = self._server_socket
+
+        # receive request
         data, r_addr = server.recvfrom(BUF_SIZE)
         if not data:
             logging.debug('UDP handle_server: data is empty')
         if self._stat_callback:
             self._stat_callback(self._listen_port, len(data))
+
+        # for a local server, request is from local client
+        # if the datagram isnot standalone, drop it
         if self._is_local:
+
             frag = common.ord(data[2])
+            # FRAG    Current fragment number
+            # ord() converts it back to number
+            # The FRAG field indicates whether or not this datagram is one of a number of fragments.
+            # Implementation of fragmentation is optional; an implementation that
+            # does not support fragmentation MUST drop any datagram whose FRAG field is other than X'00'.
+
             if frag != 0:
                 logging.warn('drop a message since frag is not 0')
                 return
             else:
                 data = data[3:]
+
+        # for a remote server, request is from local server
+        # decrypt it
+        # note that no removal of first 3 bytes canbe found here, guess in decryption?
         else:
             data = encrypt.encrypt_all(self._password, self._method, 0, data)
             # decrypt data
             if not data:
                 logging.debug('UDP handle_server: data is empty after decrypt')
                 return
+
+        # for both local and remote server, analyse request header
         header_result = parse_header(data)
         if header_result is None:
             return
         addrtype, dest_addr, dest_port, header_length = header_result
 
+        # set a place where a server relays request to
+        # a local server relays request to remote server
         if self._is_local:
             server_addr, server_port = self._get_a_server()
+        # a remote server relays request to dest, extracted from request header
         else:
             server_addr, server_port = dest_addr, dest_port
 
+        # try to find send-socket from cache
         addrs = self._dns_cache.get(server_addr, None)
         if addrs is None:
             addrs = socket.getaddrinfo(server_addr, server_port, 0,
@@ -181,10 +224,12 @@ class UDPRelay(object):
                 return
             else:
                 self._dns_cache[server_addr] = addrs
-
         af, socktype, proto, canonname, sa = addrs[0]
         key = client_key(r_addr, af)
         client = self._cache.get(key, None)
+
+        # if not found in the cache, init a new send-socket
+        # add it to the eventloop
         if not client:
             # TODO async getaddrinfo
             if self._forbidden_iplist:
@@ -201,14 +246,23 @@ class UDPRelay(object):
             self._sockets.add(client.fileno())
             self._eventloop.add(client, eventloop.POLL_IN, self)
 
+        # process the request before relay
+        # a local server relays request to remote server
+        # so request should be encrypted
         if self._is_local:
             data = encrypt.encrypt_all(self._password, self._method, 1, data)
             if not data:
                 return
+        # a remote server relays request to dest
+        # note that request has been decrypted before
+        # so just relays it
+        # note that udp request header is removed
         else:
             data = data[header_length:]
         if not data:
             return
+
+        # relay the request using send-socket
         try:
             client.sendto(data, (server_addr, server_port))
         except IOError as e:
@@ -218,13 +272,24 @@ class UDPRelay(object):
             else:
                 shell.print_exception(e)
 
+    # for a server to relay udp response
     def _handle_client(self, sock):
+
+        # receive data from given sock
         data, r_addr = sock.recvfrom(BUF_SIZE)
         if not data:
             logging.debug('UDP handle_client: data is empty')
             return
         if self._stat_callback:
             self._stat_callback(self._listen_port, len(data))
+
+        # server prepares response to relay
+        # response is composed by data received
+        # a remote server relays response to local server
+        # 1. use common.pack_addr() to compose udp request header
+        # this is because 'Each UDP datagram carries a UDP request header with it'
+        # 2. add header before data to compose response
+        # 3. encrypt all
         if not self._is_local:
             addrlen = len(r_addr[0])
             if addrlen > 255:
@@ -235,6 +300,11 @@ class UDPRelay(object):
                                            data)
             if not response:
                 return
+
+        # a local server relays response to local client
+        # 1. decrypt data
+        # 2. add first 3 bytes to compose a complete udp request header so as to compose response
+        # this is because 'Each UDP datagram carries a UDP request header with it'
         else:
             data = encrypt.encrypt_all(self._password, self._method, 0,
                                        data)
@@ -245,6 +315,12 @@ class UDPRelay(object):
                 return
             # addrtype, dest_addr, dest_port, header_length = header_result
             response = b'\x00\x00\x00' + data
+
+        # relay the response
+        # note how self._client_fd_to_server_addr is composed in _handle_server()
+        # to conclude, client_addr is where a server receives request from
+        # a local server receives request from local client
+        # a remote server receives request from local server
         client_addr = self._client_fd_to_server_addr.get(sock.fileno())
         if client_addr:
             self._server_socket.sendto(response, client_addr)
