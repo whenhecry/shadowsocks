@@ -96,7 +96,10 @@ class TCPRelayHandler(object):
         self._server = server
         self._fd_to_handlers = fd_to_handlers
         self._loop = loop
+
+        # local_sock is a server-produced client socket
         self._local_sock = local_sock
+
         self._remote_sock = None
         self._config = config
         self._dns_resolver = dns_resolver
@@ -182,13 +185,16 @@ class TCPRelayHandler(object):
                     event |= eventloop.POLL_OUT
                 self._loop.modify(self._remote_sock, event)
 
+    # write data to sock
+    # if only some of the data are written, put remaining in the buffer
+    # and update the stream to wait for writing
     def _write_to_sock(self, data, sock):
-        # write data to sock
-        # if only some of the data are written, put remaining in the buffer
-        # and update the stream to wait for writing
+
         if not data or not sock:
             return False
         uncomplete = False
+
+        # send data to the sock and confirm if complete data is sent
         try:
             l = len(data)
             s = sock.send(data)
@@ -204,6 +210,10 @@ class TCPRelayHandler(object):
                 shell.print_exception(e)
                 self.destroy()
                 return False
+
+        # if uncomplete data is sent, put remaining in the buffer, then
+        # for local sock, update down stream
+        # for remote sock, update up stream
         if uncomplete:
             if sock == self._local_sock:
                 self._data_to_write_to_local.append(data)
@@ -213,6 +223,9 @@ class TCPRelayHandler(object):
                 self._update_stream(STREAM_UP, WAIT_STATUS_WRITING)
             else:
                 logging.error('write_all_to_sock:unknown socket')
+        # if complete data is sent
+        # for local sock, update down stream
+        # for remote sock, update up stream
         else:
             if sock == self._local_sock:
                 self._update_stream(STREAM_DOWN, WAIT_STATUS_READING)
@@ -222,22 +235,30 @@ class TCPRelayHandler(object):
                 logging.error('write_all_to_sock:unknown socket')
         return True
 
+    # for local server to
     def _handle_stage_connecting(self, data):
+
+        # encrypt data and add to buffer
         if self._is_local:
             data = self._encryptor.encrypt(data)
         self._data_to_write_to_remote.append(data)
+
+        # for sslocal and fastopen, we basically wait for data and use
+        # sendto to connect
+        # only connect once
         if self._is_local and not self._fastopen_connected and \
                 self._config['fast_open']:
-            # for sslocal and fastopen, we basically wait for data and use
-            # sendto to connect
             try:
-                # only connect once
                 self._fastopen_connected = True
+
+                # create socket, connect to remote server, send data
                 remote_sock = \
                     self._create_remote_socket(self._chosen_server[0],
                                                self._chosen_server[1])
                 self._loop.add(remote_sock, eventloop.POLL_ERR, self._server)
                 data = b''.join(self._data_to_write_to_remote)
+
+                # reset buffer with unsent data, update up stream
                 l = len(data)
                 s = remote_sock.sendto(data, MSG_FASTOPEN, self._chosen_server)
                 if s < l:
@@ -248,7 +269,6 @@ class TCPRelayHandler(object):
                 self._update_stream(STREAM_UP, WAIT_STATUS_READWRITING)
             except (OSError, IOError) as e:
                 if eventloop.errno_from_exception(e) == errno.EINPROGRESS:
-                    # in this case data is not sent at all
                     self._update_stream(STREAM_UP, WAIT_STATUS_READWRITING)
                 elif eventloop.errno_from_exception(e) == errno.ENOTCONN:
                     logging.error('fast open not supported on this OS')
@@ -260,8 +280,45 @@ class TCPRelayHandler(object):
                         traceback.print_exc()
                     self.destroy()
 
+    # rfc1928
+    # 3.  Procedure for TCP-based clients
+    #
+    # 4.  Requests
+    # Once the method-dependent subnegotiation has completed, the client
+    # sends the request details.  If the negotiated method includes
+    # encapsulation for purposes of integrity checking and/or
+    # confidentiality, these requests MUST be encapsulated in the method-
+    # dependent encapsulation.
+    # The SOCKS request is formed as follows:
+    # +----+-----+-------+------+----------+----------+
+    # |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+    # +----+-----+-------+------+----------+----------+
+    # | 1  |  1  | X'00' |  1   | Variable |    2     |
+    # +----+-----+-------+------+----------+----------+
+    #
+    # 6.  Replies
+    # The SOCKS request information is sent by the client as soon as it has
+    # established a connection to the SOCKS server, and completed the
+    # authentication negotiations.  The server evaluates the request, and
+    # returns a reply formed as follows:
+    # +----+-----+-------+------+----------+----------+
+    # |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+    # +----+-----+-------+------+----------+----------+
+    # | 1  |  1  | X'00' |  1   | Variable |    2     |
+    # +----+-----+-------+------+----------+----------+
+
+    # for a server to send response with given request
+    # data is request
     def _handle_stage_addr(self, data):
         try:
+            # for a local server
+            # if the request is UDP ASSOCIATE
+            # compose response header, send it to _local_sock
+            # note that _local_sock is the server-produced client socket
+            # and ATYP/BND.ADDR/BND.PORT are its info
+            # if the request is CONNECT
+            # just trim VER CMD RSV from request header
+            # if the request is BIND or else, drop it
             if self._is_local:
                 cmd = common.ord(data[1])
                 if cmd == CMD_UDP_ASSOCIATE:
@@ -280,12 +337,14 @@ class TCPRelayHandler(object):
                     # just wait for the client to disconnect
                     return
                 elif cmd == CMD_CONNECT:
-                    # just trim VER CMD RSV
                     data = data[3:]
                 else:
                     logging.error('unknown command %d', cmd)
                     self.destroy()
                     return
+
+            # analyse header for both local and remote server
+            # note that parse_header() is used in UDPRelay as well
             header_result = parse_header(data)
             if header_result is None:
                 raise Exception('can not parse header')
@@ -297,6 +356,11 @@ class TCPRelayHandler(object):
             # pause reading
             self._update_stream(STREAM_UP, WAIT_STATUS_WRITING)
             self._stage = STAGE_DNS
+
+            # for a local server
+            # send xxx to localserver-produced client socket?
+            # encrypt data and add it to buffer
+            # resolve remote server
             if self._is_local:
                 # forward address to remote
                 self._write_to_sock((b'\x05\x00\x00\x01'
@@ -307,6 +371,8 @@ class TCPRelayHandler(object):
                 # notice here may go into _handle_dns_resolved directly
                 self._dns_resolver.resolve(self._chosen_server[0],
                                            self._handle_dns_resolved)
+            # for a remote server
+            # add data to buffer and resolve dest
             else:
                 if len(data) > header_length:
                     self._data_to_write_to_remote.append(data[header_length:])
@@ -346,6 +412,7 @@ class TCPRelayHandler(object):
             if ip:
 
                 try:
+                    # extract ip from resolved result
                     self._stage = STAGE_CONNECTING
                     remote_addr = ip
                     if self._is_local:
@@ -353,16 +420,19 @@ class TCPRelayHandler(object):
                     else:
                         remote_port = self._remote_address[1]
 
+                    # connect ip
+                    # for fastopen local server:
+                    # wait for more data to arrive and send them in one SYN
                     if self._is_local and self._config['fast_open']:
-                        # for fastopen:
-                        # wait for more data to arrive and send them in one SYN
                         self._stage = STAGE_CONNECTING
-                        # we don't have to wait for remote since it's not
-                        # created
+                        # we don't have to wait for remote since it's not created
                         self._update_stream(STREAM_UP, WAIT_STATUS_READING)
                         # TODO when there is already data in this packet
+
+                    # for non-fastopen local server, connect remote server
+                    # for remote server, connect dest
+                    # add to eventloop, update stage/stream for both local and remote
                     else:
-                        # else do connect
                         remote_sock = self._create_remote_socket(remote_addr,
                                                                  remote_port)
                         try:
@@ -384,13 +454,17 @@ class TCPRelayHandler(object):
                         traceback.print_exc()
         self.destroy()
 
+    # for a server to relay upstream
+    # handle all local read events and dispatch them to methods for each stage
     def _on_local_read(self):
-        # handle all local read events and dispatch them to methods for
-        # each stage
+
+        # _local_sock is a server-produced client socket defined in __init__()
         if not self._local_sock:
             return
         is_local = self._is_local
         data = None
+
+        # receive data from _local_sock
         try:
             data = self._local_sock.recv(BUF_SIZE)
         except (OSError, IOError) as e:
@@ -401,44 +475,85 @@ class TCPRelayHandler(object):
             self.destroy()
             return
         self._update_activity(len(data))
+
+        # for remote server, decrypt data
         if not is_local:
             data = self._encryptor.decrypt(data)
             if not data:
                 return
+
+        # stream stage ?
+        # for local server, encrypt data before send to remote server
+        # for remote server, just send to dest, no decryption ?
         if self._stage == STAGE_STREAM:
             if self._is_local:
                 data = self._encryptor.encrypt(data)
             self._write_to_sock(data, self._remote_sock)
             return
+        
+        # 3.  Procedure for TCP-based clients
+        # The server selects from one of the methods given in METHODS, and
+        # sends a METHOD selection message:
+        # +----+--------+
+        # |VER | METHOD |
+        # +----+--------+
+        # | 1  |   1    |
+        # +----+--------+
+        # The values currently defined for METHOD are:
+        # o  X'00' NO AUTHENTICATION REQUIRED
+        # o  X'01' GSSAPI
+        # o  X'02' USERNAME/PASSWORD
+        # o  X'03' to X'7F' IANA ASSIGNED
+        # o  X'80' to X'FE' RESERVED FOR PRIVATE METHODS
+        # o  X'FF' NO ACCEPTABLE METHODS
+
+        # for local server during init stage
+        # server replies local client with a METHOD selection message
         elif is_local and self._stage == STAGE_INIT:
             # TODO check auth method
             self._write_to_sock(b'\x05\00', self._local_sock)
             self._stage = STAGE_ADDR
             return
+
+        # during connecting stage
         elif self._stage == STAGE_CONNECTING:
             self._handle_stage_connecting(data)
+
+        # for local server during addr stage or remote server during init stage
+        # server replies with received request
         elif (is_local and self._stage == STAGE_ADDR) or \
                 (not is_local and self._stage == STAGE_INIT):
             self._handle_stage_addr(data)
 
+    # for a server to relay downstream
     def _on_remote_read(self):
         # handle all remote read events
         data = None
+
+        # receive data
+        # for local server, receive from remote server
+        # for remote server, receive from dest
         try:
             data = self._remote_sock.recv(BUF_SIZE)
-
         except (OSError, IOError) as e:
             if eventloop.errno_from_exception(e) in \
                     (errno.ETIMEDOUT, errno.EAGAIN, errno.EWOULDBLOCK):
                 return
+
         if not data:
             self.destroy()
             return
         self._update_activity(len(data))
+
+        # for local server, data is encrypted, so decrypt it
+        # for remote server, data will be sent to local server, so encrypt it
         if self._is_local:
             data = self._encryptor.decrypt(data)
         else:
             data = self._encryptor.encrypt(data)
+
+        # local server sends decrypted data to local clients
+        # remote server sends encrypted data to local server
         try:
             self._write_to_sock(data, self._local_sock)
         except Exception as e:
@@ -449,7 +564,9 @@ class TCPRelayHandler(object):
             self.destroy()
 
     def _on_local_write(self):
-        # handle local writable event
+        # send data to be sent to local client or local server
+        # reset buffer with unsent data
+        # if thereis no unsent data, update down stream
         if self._data_to_write_to_local:
             data = b''.join(self._data_to_write_to_local)
             self._data_to_write_to_local = []
@@ -458,7 +575,7 @@ class TCPRelayHandler(object):
             self._update_stream(STREAM_DOWN, WAIT_STATUS_READING)
 
     def _on_remote_write(self):
-        # handle remote writable event
+        # almost same as _on_local_write()
         self._stage = STAGE_STREAM
         if self._data_to_write_to_remote:
             data = b''.join(self._data_to_write_to_remote)
@@ -480,7 +597,6 @@ class TCPRelayHandler(object):
         self.destroy()
 
     def handle_event(self, sock, event):
-        # handle all events in this handler and dispatch them to methods
         if self._stage == STAGE_DESTROYED:
             logging.debug('ignore handle_event: destroyed')
             return
@@ -563,6 +679,8 @@ class TCPRelay(object):
         self._timeout_offset = 0   # last checked position for timeout
         self._handler_to_timeouts = {}  # key: handler value: index in timeouts
 
+        # set server addr from config
+        # init a socket, bind to server addr, listen
         if is_local:
             listen_addr = config['local_address']
             listen_port = config['local_port']
@@ -570,7 +688,6 @@ class TCPRelay(object):
             listen_addr = config['server']
             listen_port = config['server_port']
         self._listen_port = listen_port
-
         addrs = socket.getaddrinfo(listen_addr, listen_port, 0,
                                    socket.SOCK_STREAM, socket.SOL_TCP)
         if len(addrs) == 0:
@@ -581,14 +698,19 @@ class TCPRelay(object):
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind(sa)
         server_socket.setblocking(False)
+
+        # fast_open ?
         if config['fast_open']:
             try:
                 server_socket.setsockopt(socket.SOL_TCP, 23, 5)
             except socket.error:
                 logging.error('warning: fast open is not available')
-                self._config['fast_open'] = False
+                self._config['fast_open'] = Falses
+
         server_socket.listen(1024)
         self._server_socket = server_socket
+
+        # stat_callback ?
         self._stat_callback = stat_callback
 
     def add_to_loop(self, loop):

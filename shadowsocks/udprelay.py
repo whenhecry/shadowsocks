@@ -149,6 +149,7 @@ class UDPRelay(object):
             # just an address
             pass
 
+    # rfc1928
     # 7.  Procedure for UDP-based clients
     # Each UDP datagram carries a UDP request header with it
     # header means all before DATA
@@ -167,6 +168,12 @@ class UDPRelay(object):
         server = self._server_socket
 
         # receive request
+        # note that no listen()/accept() is used as TCP
+        # this is because udp doesn't require long-lived connection
+        # so the server does not need to listen for and accept connections
+        # It only needs to use bind() to associate its socket with a port
+        # and then wait for individual messages
+        # _server_socket has been bound in __init__()
         data, r_addr = server.recvfrom(BUF_SIZE)
         if not data:
             logging.debug('UDP handle_server: data is empty')

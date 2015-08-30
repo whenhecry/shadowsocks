@@ -101,7 +101,7 @@ class KqueueLoop(object):
     def close(self):
         self._kqueue.close()
 
-
+# for windows
 class SelectLoop(object):
 
     def __init__(self):
@@ -110,14 +110,18 @@ class SelectLoop(object):
         self._x_list = set()
 
     def poll(self, timeout):
+        # check selectServer.py/selectClient.py for reference
         r, w, x = select.select(self._r_list, self._w_list, self._x_list,
                                 timeout)
+
+        # set default value for a key in dict
         results = defaultdict(lambda: POLL_NULL)
         for p in [(r, POLL_IN), (w, POLL_OUT), (x, POLL_ERR)]:
             for fd in p[0]:
                 results[fd] |= p[1]
         return results.items()
 
+    # add socket to the corresponding r/w/x list
     def register(self, fd, mode):
         if mode & POLL_IN:
             self._r_list.add(fd)
@@ -126,6 +130,7 @@ class SelectLoop(object):
         if mode & POLL_ERR:
             self._x_list.add(fd)
 
+    # remove socket from all the list
     def unregister(self, fd):
         if fd in self._r_list:
             self._r_list.remove(fd)
@@ -134,6 +139,7 @@ class SelectLoop(object):
         if fd in self._x_list:
             self._x_list.remove(fd)
 
+    # reregister a socket
     def modify(self, fd, mode):
         self.unregister(fd)
         self.register(fd, mode)
@@ -141,7 +147,7 @@ class SelectLoop(object):
     def close(self):
         pass
 
-
+# a package for kqueue and select
 class EventLoop(object):
     def __init__(self):
         if hasattr(select, 'epoll'):
@@ -192,7 +198,9 @@ class EventLoop(object):
     def run(self):
         events = []
         while not self._stopping:
-            asap = False
+            asap = False  # wtf ?
+
+            # start select
             try:
                 events = self.poll(TIMEOUT_PRECISION)
             except (OSError, IOError) as e:
@@ -208,6 +216,9 @@ class EventLoop(object):
                     traceback.print_exc()
                     continue
 
+            # for each socket
+            # get corresponding handler
+            # handle socket according socket event
             for sock, fd, event in events:
                 handler = self._fdmap.get(fd, None)
                 if handler is not None:
@@ -216,6 +227,8 @@ class EventLoop(object):
                         handler.handle_event(sock, fd, event)
                     except (OSError, IOError) as e:
                         shell.print_exception(e)
+
+            # call callbacks when asap or timeout
             now = time.time()
             if asap or now - self._last_time >= TIMEOUT_PRECISION:
                 for callback in self._periodic_callbacks:
