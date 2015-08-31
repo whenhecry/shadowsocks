@@ -109,6 +109,7 @@ class SelectLoop(object):
         self._w_list = set()
         self._x_list = set()
 
+    # return {fd: event}
     def poll(self, timeout):
         # check selectServer.py/selectClient.py for reference
         r, w, x = select.select(self._r_list, self._w_list, self._x_list,
@@ -121,7 +122,7 @@ class SelectLoop(object):
                 results[fd] |= p[1]
         return results.items()
 
-    # add socket to the corresponding r/w/x list
+    # add fd to the corresponding r/w/x set
     def register(self, fd, mode):
         if mode & POLL_IN:
             self._r_list.add(fd)
@@ -130,7 +131,7 @@ class SelectLoop(object):
         if mode & POLL_ERR:
             self._x_list.add(fd)
 
-    # remove socket from all the list
+    # remove fd from all the set
     def unregister(self, fd):
         if fd in self._r_list:
             self._r_list.remove(fd)
@@ -139,7 +140,7 @@ class SelectLoop(object):
         if fd in self._x_list:
             self._x_list.remove(fd)
 
-    # reregister a socket
+    # update event that linked to fd
     def modify(self, fd, mode):
         self.unregister(fd)
         self.register(fd, mode)
@@ -149,6 +150,7 @@ class SelectLoop(object):
 
 # a package for kqueue and select
 class EventLoop(object):
+    # f/fd are alternative repr of socket
     def __init__(self):
         if hasattr(select, 'epoll'):
             self._impl = select.epoll()
@@ -162,16 +164,18 @@ class EventLoop(object):
         else:
             raise Exception('can not find any available functions in select '
                             'package')
-        self._fdmap = {}  # (f, handler)
+        self._fdmap = {}  # {fd: (f, handler)}
         self._last_time = time.time()
         self._periodic_callbacks = []
         self._stopping = False
         logging.debug('using event model: %s', model)
 
+    # return [(f, fd, event)]
     def poll(self, timeout=None):
         events = self._impl.poll(timeout)
         return [(self._fdmap[fd][0], fd, event) for fd, event in events]
 
+    # register f and add handler
     def add(self, f, mode, handler):
         fd = f.fileno()
         self._fdmap[fd] = (f, handler)
@@ -217,8 +221,10 @@ class EventLoop(object):
                     continue
 
             # for each socket
-            # get corresponding handler
-            # handle socket according socket event
+            # 1. resolve corresponding handler
+            # note that link between socket and handler is established elsewhere
+            # link is established using eventloop.add()
+            # 2. handle socket according to socket event
             for sock, fd, event in events:
                 handler = self._fdmap.get(fd, None)
                 if handler is not None:
@@ -228,7 +234,7 @@ class EventLoop(object):
                     except (OSError, IOError) as e:
                         shell.print_exception(e)
 
-            # call callbacks when asap or timeout
+            # call callbacks when asap or time is out
             now = time.time()
             if asap or now - self._last_time >= TIMEOUT_PRECISION:
                 for callback in self._periodic_callbacks:
