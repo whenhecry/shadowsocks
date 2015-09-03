@@ -145,7 +145,7 @@ def build_address(address):
 # +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
 
 # compose a request
-# only Header and Question are composed
+# only Header and Question sections are composed
 def build_request(address, qtype):
     # compose Header
     # struct.pack() convert number/string to binary data with given format
@@ -183,8 +183,8 @@ def build_request(address, qtype):
 #                 the RDATA field is a 4 octet ARPA Internet address.
 
 # compose str repr of domain name, with octet data and offset for RDATA given
-# according to the info above, RDATA contains octet addr
-# thus socket.inet_ntop canbe used to directly get ip from RDATA
+# note that RDATA contains octet addr
+# thus socket.inet_ntop() canbe used to directly get ip from RDATA
 def parse_ip(addrtype, data, length, offset):
     # socket.inet_ntop() convert a packed IP address to its string repr
     # ntop means network to printable
@@ -199,10 +199,7 @@ def parse_ip(addrtype, data, length, offset):
         return data[offset:offset + length]
 
 
-# The pointer takes the form of a two octet sequence:
-# +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-# | 1  1|                OFFSET                   |
-# +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+# 4.1.4.
 #
 # The compression scheme allows a domain name in a message to be
 # represented as either:
@@ -227,7 +224,7 @@ def parse_name(data, offset):
         # if the first byte is a pointer
         # dig into it, retrieve the innermost labels and append it as tail
         # then return directly
-        # this is because pointer, if exists, is at the end of labels
+        # this is because pointer, if exists, is at the end of label sequence
         if (l & (128 + 64)) == (128 + 64):
             # pointer
             pointer = struct.unpack('!H', data[p:p + 2])[0]
@@ -320,6 +317,7 @@ def parse_header(data):
     # drop packet with incomplete header
     return None
 
+# 4.1.
 # +---------------------+
 # |        Header       | 
 # +---------------------+
@@ -344,8 +342,8 @@ def parse_response(data):
             res_id, res_qr, res_tc, res_ra, res_rcode, res_qdcount, \
                 res_ancount, res_nscount, res_arcount = header
 
-            qds = []  # (name, None, record_type, record_class, None, None)
-            ans = []  # (name, ip, record_type, record_class, record_ttl)
+            qds = []  # [(name, None, record_type, record_class, None, None)]
+            ans = []  # [(name, ip, record_type, record_class, record_ttl)]
             offset = 12
 
             # extract all questions and answers, and store them
@@ -355,13 +353,17 @@ def parse_response(data):
                 l, r = parse_record(data, offset, True)
 
                 # update offset
+                # Question section contains QDCOUNT entries
                 offset += l
+
                 if r:
                     qds.append(r)
 
             # analyse Answer section
             for i in range(0, res_ancount):
                 l, r = parse_record(data, offset)
+
+                # Answer section contains ANCOUNT entries
                 offset += l
                 if r:
                     ans.append(r)
@@ -398,8 +400,8 @@ def is_valid_hostname(hostname):
 class DNSResponse(object):
     def __init__(self):
         self.hostname = None
-        self.questions = []  # [(addr, type, class)]
-        self.answers = []  # [(addr, type, class)]
+        self.questions = []  # [(None, record_type, record_class)]
+        self.answers = []  # [(ip, record_type, record_class)]
 
     def __str__(self):
         return '%s: %s' % (self.hostname, str(self.answers))
@@ -481,18 +483,24 @@ class DNSResolver(object):
             raise Exception('already add to loop')
         self._loop = loop
         # TODO when dns server is IPv6
+
+        # init a UDP client socket at server
+        # add socket to eventloop, set event as IN
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
                                    socket.SOL_UDP)
-        # dnsserver只作为发送请求的一个东西，是客户端，应该是client，所以没bind
         self._sock.setblocking(False)
-        # 把自己的socket加到loop里面
         loop.add(self._sock, eventloop.POLL_IN, self)
-        # 这里加入了handler，eventloop检测到socket有“动静”时调用self.handle_events
+
+        # add callback to be called when asap or time is out
         loop.add_periodic(self.handle_periodic)
 
     def _call_callback(self, hostname, ip, error=None):
-        # callbacks is a list of callbacks
+        # callbacks is a list of callbacks linked to one hostname
+        # dict.get(k[,d]) -> D[k] if k in D, else d
         callbacks = self._hostname_to_cb.get(hostname, [])
+
+        # call each callback
+        # then unestablish link between callback and hostname, reset status
         for callback in callbacks:
             if callback in self._cb_to_hostname:
                 del self._cb_to_hostname[callback]
@@ -507,27 +515,36 @@ class DNSResolver(object):
         if hostname in self._hostname_status:
             del self._hostname_status[hostname]
 
+    # from data, namely ns response, extract ip and save to cache
     def _handle_data(self, data):
+        # analyse response data and get hostname, qds, ans
         response = parse_response(data)
+
         if response and response.hostname:
             hostname = response.hostname
             ip = None
+
+            # for common record_type and record_class, save ip
             for answer in response.answers:
                 if answer[1] in (QTYPE_A, QTYPE_AAAA) and \
                         answer[2] == QCLASS_IN:
                     ip = answer[0]
                     break
 
-            # dict.get(k[,d]) -> D[k] if k in D, else d
+            # further process ip
+            # if ip is None and current status is IPv4
+            # change record_type to IPv6 and rerequest
+            # status ?
             if not ip and self._hostname_status.get(hostname, STATUS_IPV6) \
                     == STATUS_IPV4:
                 self._hostname_status[hostname] = STATUS_IPV6
                 self._send_req(hostname, QTYPE_AAAA)
             else:
+                # store ip, call callbacks
                 if ip:
-                    self._cache[hostname] = ip  # store ip
-                    # 这里调用回调_call_callback
-                    self._call_callback(hostname, ip)  # ? callback
+                    self._cache[hostname] = ip
+                    self._call_callback(hostname, ip)
+
                 elif self._hostname_status.get(hostname, None) == STATUS_IPV6:
                     for question in response.questions:
                         if question[1] == QTYPE_AAAA:
@@ -535,11 +552,11 @@ class DNSResolver(object):
                             break
 
     def handle_event(self, sock, fd, event):
-        # if socket doesn't belongs to dns, jump over
+        # if socket is not the client socket at server side, jump over
         if sock != self._sock:
             return
 
-        # if error occurs, restart
+        # if error occurs, restart and reinit a client socket
         if event & eventloop.POLL_ERR:
             logging.error('dns socket err')
             self._loop.remove(self._sock)
@@ -549,18 +566,22 @@ class DNSResolver(object):
                                        socket.SOL_UDP)
             self._sock.setblocking(False)
             self._loop.add(self._sock, eventloop.POLL_IN, self)
-        # else, receive data
+
+        # or server receives response from ns and extract ip to cache
+        # drop packet not sent by ns
+        from response extract ip
         else:
-            # 因为是dns基于udp报文，所以没有连接要处理
             data, addr = sock.recvfrom(1024)
             if addr[0] not in self._servers:
                 logging.warn('received a packet other than our dns')
                 return
             self._handle_data(data)
 
+    # ?
     def handle_periodic(self):
         self._cache.sweep()
 
+    # ?
     def remove_callback(self, callback):
         hostname = self._cb_to_hostname.get(callback)
         if hostname:
@@ -575,6 +596,7 @@ class DNSResolver(object):
                     if hostname in self._hostname_status:
                         del self._hostname_status[hostname]
 
+    # build request and send to ns
     def _send_req(self, hostname, qtype):
         req = build_request(hostname, qtype)
         for server in self._servers:
@@ -585,7 +607,7 @@ class DNSResolver(object):
     # a callback caller
     # callback serves as an argument of the parent method
     # when the parent method is called and completes, the callback method is invoked
-    # a callback usage example at https://en.wikipedia.org/wiki/Callback_(computer_programming)
+    # check https://en.wikipedia.org/wiki/Callback_(computer_programming)
     def resolve(self, hostname, callback):
         if type(hostname) != bytes:
             hostname = hostname.encode('utf8')
@@ -620,17 +642,16 @@ class DNSResolver(object):
             # arr is a list of callbacks
             arr = self._hostname_to_cb.get(hostname, None)
 
-            # or
+            # if hostname is not linked with any callbacks
+            # set default status, send request and link hostname with callback
             if not arr:
                 self._hostname_status[hostname] = STATUS_IPV4
-                # 请求报文发出去
                 self._send_req(hostname, QTYPE_A)
-                # 同时在_hostname_to_cb注册一个{hostname:callback}的一对
-                # 要hostname因为这个socket可以发出去很多不同hostname的解析请求
                 self._hostname_to_cb[hostname] = [callback]
                 self._cb_to_hostname[callback] = hostname
+            # or just end request
             else:
-                arr.append(callback)
+                arr.append(callback)  # meaningless
                 # TODO send again only if waited too long
                 self._send_req(hostname, QTYPE_A)
 
